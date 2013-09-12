@@ -1,0 +1,17 @@
+
+# How to build
+
+It should be enough to call make. Allthough, building modules for linux
+requires a configured and built tree (usually found in
+/lib/modules/$KERNEL_VERSION).  If it is not there you'll have to either give a
+paramer KPATH make or change the parameter in the Makefile)
+
+# How to load
+
+Once the module has been built you can
+
+sudo ./insmod ./ber_emulator.ko
+
+which should create a new device in /dev/sbea (ssd ber emulator, device name a)
+that you can read and write to.
+
