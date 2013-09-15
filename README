@@ -10,7 +10,14 @@ parameter KPATH to make or change the parameter in the Makefile.
 
 Once the module has been built you can
 
-sudo insmod ./ber_emulator.ko
+sudo insmod ./ber_emulator.ko target_device=/dev/sdXX (where XX is the correct ending of your target device)
 
 which should create a new device /dev/sbea (ssd ber emulator, device name a)
-that you can read and write to.
+that you can read and write to and (some) requests are forwarded to the target device.
+
+WARNING:
+    Since the module is dropping requests it will probabily corrupt the data on
+    the target device.
+
+    Do not set the target to any device you care about.
+
