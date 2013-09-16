@@ -1,3 +1,5 @@
 TODO:
+ * Return the geometry of the target device; set the total size as the total
+   device of the target device.
  * Remove some of the annoying debug messages in DMESG
  * Handle errors better; and more gracefully.
