@@ -6,6 +6,7 @@ all:
 clean:
 	rm -rf .*.cmd *.o *.ko *.mod.c .tmp_versions modules.order Module.symvers
 
-obj-m := ber_emulator.o
+obj-m := sbe.o
+sbe-objs := ber_emulator.o bitmap.o
 
 .PHONY: modules clean

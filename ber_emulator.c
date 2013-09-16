@@ -9,6 +9,8 @@
 #include <linux/slab.h>
 #include <linux/random.h>
 
+#include "bitmap.h"
+
 MODULE_VERSION("0.0");
 MODULE_LICENSE("GPL v2");
 
@@ -56,16 +58,13 @@ static int uber_rate = -14;
 module_param(uber_rate, int, S_IRUGO | S_IWUSR);
 
 // Number of pages the device has
-static int number_of_pages = 25600;
+// static int number_of_pages = 1933312;
+static int number_of_pages = 128256;
 module_param(number_of_pages, int, S_IRUGO);
 
 // The size of each page.
 static int page_size = 4096;
 module_param(page_size, int, S_IRUGO);
-
-// Bit field for blocks that have errors.
-// When an block is written we do
-int err_blocks = 0;
 
 #define SBE_MINORS 1
 
@@ -83,6 +82,8 @@ struct sbe_dev {
 
         // mutual exclusion lock
         spinlock_t lock;
+
+        struct sparse_bitmap *bm;
 
 #if QUEUE == 0
         struct block_device *target_bdev;
@@ -112,7 +113,7 @@ int rand(void) {
 }
 
 bool bad_block(int ber_exponent) {
-    int t[][2] = {
+    unsigned int t[][2] = {
         {4294967295, 4294967295},
         {4294967295, 4294967295},
         {4294967295, 4294967295},
@@ -173,23 +174,23 @@ int handle_ioctl(struct block_device *bdev,
 }
 
 // Helper for flipping a `coin` and mark the block bad with some probability
-static inline bool writing_block(unsigned long sector, int uber_rate) {
+static inline bool writing_block(struct sbe_dev *dev, unsigned long sector, int uber_rate) {
     if(bad_block(uber_rate)) {
         printk(KERN_NOTICE "Block number %ld marked as bad\n", sector);
         // Mark the block as bad
-        err_blocks |= 1 << sector;
+        set_bit(dev->bm, sector);
         return 1;
     } else {
         printk(KERN_NOTICE "Block number %ld marked as good\n", sector);
         // Mark the block as good
-        err_blocks &= ~(1 << sector);
+        unset_bit(dev->bm, sector);
         return 0;
     }
 }
 
 // Return true if the given sector has been marked as bad
-static inline bool sector_has_error(int sector) {
-    return err_blocks & (1 << sector);
+static inline bool sector_has_error(struct sbe_dev *dev, int sector) {
+    return get_bit(dev->bm, sector);
 }
 
 /*
@@ -214,7 +215,7 @@ static int handle_request(struct sbe_dev *dev, int dir,
     // direction != 0 is a write request,
     // direction  = 0 is a read request.
     if(dir) {
-        writing_block(sbe_sector, uber_rate);
+        writing_block(dev, sbe_sector, uber_rate);
         memcpy(dev->data + offset, buffer, byte_count);
     } else {
         if(sector_has_error(sbe_sector)) {
@@ -239,12 +240,14 @@ static void sbe_request(struct request_queue *queue) {
     while(req) {
         struct sbe_dev *dev = req->rq_disk->private_data;
 
-        printk(KERN_NOTICE "Request type %d to dir = %d pos = %ld count = %d (bdev = %d)\n", req->cmd_type,
+        printk(KERN_NOTICE "Request type %d to dir = %d pos = %ld count = %d (bdev = %d)\n",
+                req->cmd_type,
                 rq_data_dir(req), blk_rq_pos(req), blk_rq_cur_sectors(req), 0);
 
         // Should we handle any other request than REQ_TYPE_FS?
         if(req->cmd_type == REQ_TYPE_FS) {
-            r = handle_request(dev, rq_data_dir(req), blk_rq_pos(req), blk_rq_cur_sectors(req), req->buffer);
+            r = handle_request(dev, rq_data_dir(req), blk_rq_pos(req),
+                    blk_rq_cur_sectors(req), req->buffer);
         } else {
             r = -EIO;
         }
@@ -260,9 +263,10 @@ static int handle_bio(struct sbe_dev *dev, struct bio *bio) {
 
 
     if(bio_data_dir(bio) == WRITE) {
-        printk(KERN_NOTICE "Handling bio write. Marking sector %ld as %s\n", sbe_sector, writing_block(sbe_sector, uber_rate) ? "bad" : "good");
+        printk(KERN_NOTICE "Handling bio write. Marking sector %ld as %s\n",
+                sbe_sector, writing_block(dev, sbe_sector, uber_rate) ? "bad" : "good");
     } else {
-        if(sector_has_error(sbe_sector)) {
+        if(sector_has_error(dev, sbe_sector)) {
             printk(KERN_NOTICE "Handling bio. Sector %ld marked as bad\n", sbe_sector);
             return -EIO;
         } else {
@@ -277,7 +281,8 @@ static void handle_make_request(struct request_queue *queue, struct bio *bio) {
     int err = 0;
     struct sbe_dev *dev = queue->queuedata;
 
-    printk(KERN_WARNING "sbe: forwarding request to another device %p %p\n", dev, dev->target_bdev);
+    printk(KERN_WARNING "sbe: forwarding request to another device %p %p\n",
+            dev, dev->target_bdev);
 
 
     if(unlikely(IS_ERR(dev->target_bdev) || dev->target_bdev == NULL)) {
@@ -322,14 +327,17 @@ static int init_device(struct sbe_dev *dev, int n) {
         printk(KERN_WARNING "sbe: setting target device: %s\n", target_device);
     }
 
+    dev->bm = init_bitmap();
+
     dev->size = number_of_pages * page_size;
+#if QUEUE == 1
     dev->data = vmalloc(dev->size); // non-contiguous allocated pages.
     if(dev-> data == NULL) {
         printk(KERN_WARNING "sbe: could not vmalloc %d bytes\n", dev->size);
         return -ENOMEM;
     }
     memset(dev->data, 0, dev->size);
-#if QUEUE == 0
+#else
     bdev = NULL;
     bdev = lookup_bdev(target_device);
 
@@ -372,17 +380,23 @@ static int init_device(struct sbe_dev *dev, int n) {
     dev->gd->queue = dev->queue;
     dev->gd->private_data = dev;
     snprintf(dev->gd->disk_name, 32, "sbe%c", n + 'a');
-    set_capacity(dev->gd, number_of_pages * (page_size / KPAGE_SIZE)); // Number of kernel sized sector
+     // Number of kernel sized sector
+    set_capacity(dev->gd, number_of_pages * (page_size / KPAGE_SIZE));
     add_disk(dev->gd);
 
     return 0;
 
 err:
     if(dev) {
+        if(dev->bm) {
+            delete_bitmap(dev->bm);
+        }
+#if QUEUE == 1
         if(dev->data) {
             vfree(dev->data);
             dev->data = NULL;
         }
+#endif
     }
     return -EBUSY; // XXX: o.O
 }
@@ -421,6 +435,12 @@ err:
 static void __exit cleanup_function(void) {
     struct sbe_dev *dev = devices;
 
+    if(dev == NULL) {
+        goto post_dev;
+    }
+
+    delete_bitmap(dev->bm);
+
     if(dev->gd) {
         del_gendisk(dev->gd);
         put_disk(dev->gd);
@@ -434,15 +454,19 @@ static void __exit cleanup_function(void) {
 #endif
     }
 
+#if QUEUE == 1
     if(dev->data) {
         vfree(dev->data);
     }
+#endif
 
 #if QUEUE == 0
     if(dev->target_bdev) {
         blkdev_put(dev->target_bdev, FMODE_READ|FMODE_WRITE);
     }
 #endif
+
+post_dev:
 
     unregister_blkdev(sbe_major, "sbe");
     kfree(devices);
